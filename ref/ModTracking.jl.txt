@@ -1,0 +1,602 @@
+module ModTracking
+
+using DataFrames, VetschLib, Pipe, CSV, Dates, StatsBase
+
+#=
+    I need a way to pull in the Sharepoint Mod Data
+    All this function does is pull in the Sharepoint data
+    The Sharepoint data has to be pulled from sharepoint and saved in a CSV.
+=#
+
+"""
+    import_sharepoint()
+
+Pulls in the Sharepoint Data
+"""
+function import_sharepoint()
+    df::DataFrame = CSV.File(
+        "inputs/accounting_sharepoint_mods.csv",
+        normalizenames = true
+    ) |> DataFrame |> cleannames!
+end # function
+
+#=
+    Normally these functions wouldn't know how to handle missing values and would
+    throw an error when they encounter one. However, I want to override that behaviour
+    and say that if one of these functions sees a missing, return a missing
+=#
+
+Dates.Date(s::Missing, df::DateFormat) = missing
+Base.String(s::Missing) = missing
+Base.uppercase(x::Missing) = missing
+
+
+#=
+    This gets turns the subsequent effective date field into a Date field i/o a string
+    field. It then capitalizes all of the contract ids since there are several that
+    don't have capitalized letters, which messes with joins between the sharepoint file
+    and any data that you pull out of the source. It then removes any row that has a missing
+    subsequent effective date, and for those contracts which have more than one
+    subsequent effective date, it takes the first one.
+=#
+"""
+    mods()
+
+Cleans up the modification table to have the appropriate fields and types
+"""
+function mods()
+    dfmt::DateFormat = dateformat"m/d/y"
+    df::DataFrame = @pipe import_sharepoint() |>
+    select(
+        _,
+            [
+                :contract_id,
+                :subsequent_effective_date
+            ]
+        ) |>
+        transform(
+            _,
+            :subsequent_effective_date => ByRow(
+                sed -> String(sed)
+            ) => :subsequent_effective_date
+        ) |>
+        transform(
+            _,
+            :subsequent_effective_date => ByRow(
+                sed -> Dates.Date(sed, dfmt)
+            ) => :subsequent_effective_date,
+            :contract_id => ByRow(
+                c -> uppercase(c)
+            ) => :contract_id
+        ) |>
+        filter(
+            r -> !ismissing(r.subsequent_effective_date),
+            _
+        ) |>
+        groupby(
+            _,
+            :contract_id
+        ) |>
+        combine(
+            _,
+            :subsequent_effective_date => (sed -> minimum(skipmissing(sed))) => :subsequent_effective_date
+        )
+        return df
+end # function
+
+
+#=
+    Any time you see something wrapped in a sql function call like on line
+    102, you can run that in SQL.
+    This returns a dataset on the invoice level that has all of the unique, valid invoices
+    for each contract, the amounts due and paid, and whether or not the invoice is still
+    open. The last map and sort are just cleanup between Julia and SQL, and a specific quirk
+    to the Julia Language
+=#
+"""
+    openinvoices()
+
+Pulls a DataFrame from the source of all of the open invoices for a given invoice date
+"""
+function openinvoices()
+    df::DataFrame = sql(
+        """
+        set nocount on;
+
+        drop table if exists #phs;
+
+        select distinct ph.Contract_Id, ph.Finance_Product, ph.Invoice_Number, convert(date, ph.Due_Date) 'due_date',
+        convert(date, ph.Invoice_Date) 'invoice_date', convert(date, ph.Date_Paid) 'date_paid', ph.check_number, ph.invoice_description, ph.Due_Amount,
+        ph.Amount_Paid, ph.Principal_Amount, ph.interest_amount, ph.contract_is_charge_off, ph.entered_by,
+        case
+            when Payment_Type in ('ACH', 'Check', 'N/A') and
+                Invoice_Description in('Loan Payment', 'Loan Payoff', 'Interest Payment') then 1
+            else 0
+        end 'is_valid_invoice', case
+            when Check_Number like 'Credit Memo' then 1
+            else 0
+        end 'is_credit_memo', aph.is_cm_invoice, case
+            when aph.is_cm_invoice = 1 then 0
+            else ph.Amount_Paid
+        end 'actual_amount_paid', case
+            when Terminated = 0 then 1
+            else 0
+        end 'is_active'
+        into #phs
+        from Report_Aspire_Payment_History ph
+        left join(
+            select aph.Contract_Id, aph.Invoice_Number, sum(
+                case
+                    when Check_Number like 'Credit Memo' then 1
+                    else 0
+                end
+            ) as 'is_cm_invoice'
+            from Report_Aspire_Payment_History aph
+            group by aph.Contract_Id, aph.Invoice_Number
+        ) as aph on aph.Contract_Id = ph.Contract_Id and aph.Invoice_Number = ph.Invoice_Number
+        where ph.Contract_Id like '%-%' and
+        ph.Payment_Type in ('ACH', 'Check', 'N/A') and
+        ph.Invoice_Description in ('Loan Payment', 'Loan Payoff', 'Interest Payment') and
+        aph.is_cm_invoice = 0 and
+        ph.due_date < convert(date, getdate()) and
+        ph.Contract_Id in (
+            select contract_id
+        from Opportunity_Contract_LMS as lms
+        where (lms.Termination_Date is null or
+        lms.Termination_Date > '2019-12-31') and
+        lms.Contract_Id like '%-%' and
+        lms.Contract_Id not like '%-%S%'
+        );
+
+
+        drop table if exists #invoices;
+
+        select distinct Contract_Id, invoice_date, Invoice_Number, min(due_date) as due_date, avg(due_amount) as due_amount,
+        max(date_paid) as date_paid, sum(amount_paid) as amount_paid
+        into #invoices
+        from #phs
+        group by Contract_Id, invoice_date, Invoice_Number;
+
+        drop table if exists #open;
+
+        select Contract_Id, Invoice_Number, convert(datetime, due_date) as due_date, amount_paid, due_amount, case
+            when due_amount > amount_paid then 1
+            when amount_paid is null then 1
+            else 0
+        end as is_open_invoice
+        from #invoices
+        """
+    )
+    df.due_date = map(df.due_date) do x
+        Dates.Date(x)
+    end
+    sort!(df, :due_date)
+    return df
+end # function
+
+
+
+"""
+    joindateswithinvoices()
+
+Joins the Sharepoint data with the open invoices table
+"""
+function joindateswithinvoices()
+    df::DataFrame = @pipe leftjoin(
+        mods(),
+        openinvoices(),
+        on = :contract_id,
+    )
+end # function
+
+# """
+#     invoices_after_sed()
+#
+# Filters out invoices before the subsequent effective date
+# """
+# function invoices_after_sed()
+#     filter!(
+#         r -> ((ismissing(r.subsequent_effective_date)) || (r.due_date >= r.subsequent_effective_date)),
+#         joindateswithinvoices()
+#     )
+# end # function
+
+
+#=
+    This is where the first part of quite a bit of logic happens:
+    Here are the steps:
+        1. Insert a column of all ones
+            - In SQL: Select *, 1 as counter from table
+        2. Group the table by contract id
+        3. If the due date is greater than or equal to the subsequent effective date,
+            then 1, else 0, which makes up a binary flag column called
+            invoice_post_sub_eff_date, which is meant to determine if an invoice
+            was due on or after the subsequent effective date.
+        4. If an invoice occured or was open before the subsequent effective date, set
+            to zero for now. This is a setup for calculating the Failure Rates.
+        5. Find the first and the second invoices
+        6. Mark whether or not the first or second invoices are still open.
+=#
+
+"""
+    invoicenumber()
+
+Calculate the number of invoices since the subsequent effective date
+"""
+function invoicenumber()
+    tmp::DataFrame = joindateswithinvoices()
+    out = @pipe tmp |>
+    filter(
+        r -> !occursin("w", r.contract_id),
+        _,
+    ) |>
+    sort(
+        _,
+        :due_date
+    ) |>
+    insertcols!(
+        _,
+        ncol(_) + 1,
+        :counter => 1
+    ) |>
+    groupby(
+        _,
+        :contract_id
+    ) |>
+    transform(
+        _,
+        [:due_date, :subsequent_effective_date] => ByRow(
+            (d, s) -> if d >= s
+                1
+            else
+                0
+            end # if
+        ) => :invoice_post_sub_eff_date
+    ) |>
+    transform(
+        _,
+        [:counter, :invoice_post_sub_eff_date] => ByRow(
+            (c, i) -> if i == 0
+                0
+            else
+                c
+            end # if
+        ) => :counter,
+        [:is_open_invoice, :invoice_post_sub_eff_date] => ByRow(
+            (o, s) -> if s == 0
+                0
+            else
+                o
+            end
+        ) => :is_open_invoice
+    ) |>
+    transform(
+        _,
+        :counter .=> (c -> cumsum(c)) .=> :num_invoices,
+        :is_open_invoice .=> (i -> cumsum(i)) .=> :num_open_invoices
+    ) |>
+    transform(
+        _,
+        :num_invoices => ByRow(
+            i -> if i == 2
+                1
+            else
+                0
+            end # if
+        ) => :is_2nd_invoice,
+        :num_invoices => ByRow(
+            i -> if i == 1
+                1
+            else
+                0
+            end # if
+        ) => :is_1st_invoice,
+        [:num_invoices, :is_open_invoice] => ByRow(
+            (ni, oi) -> if (ni == 1) && (oi == 1)
+                1
+            else
+                0
+            end # if
+        ) => :first_invoice_failure,
+        [:num_invoices, :is_open_invoice] => ByRow(
+            (ni, oi) -> if (ni == 2) && (oi == 1)
+                1
+            else
+                0
+            end # if
+        ) => :second_invoice_failure,
+    )
+
+end # function
+
+
+#=
+    This imports the query from the workbench.
+    The SOQL for this is:
+    SELECT Additional_Information__c,Id FROM Opportunity WHERE Additional_Information__c != ''
+=#
+
+"""
+    import_sfdata()
+
+Imports the data exported fromt the Salesforce Workbench
+"""
+function import_sfdata()
+    out::DataFrame = CSV.File("inputs/sf_export.csv", normalizenames = true) |> DataFrame |> cleannames!
+end # function
+
+# Gives a way for the Workbench to get contract ids
+function bridge_sftocak()
+    out::DataFrame = sql(
+    """
+    select distinct opp.salesforce_id, lms.Contract_Id
+    from Opportunity as opp
+    inner join Opportunity_Contract as oc on oc.Opportunity_Id = opp.id
+    inner join Opportunity_Contract_LMS as lms on lms.Contract_Oid = oc.Aspire_Id
+    """
+    )
+end # function
+
+
+function join_sf_phs()
+    out::DataFrame = @pipe invoicenumber() |>
+    innerjoin(
+        _,
+        innerjoin(
+            import_sfdata(),
+            bridge_sftocak(),
+            on = :id => :salesforce_id
+        ),
+        on = :contract_id
+    )
+    return out
+end # function
+
+
+# Pulls the Extended Covid Mod Reasons from the contract modification report
+
+function extendedmods()
+    out::DataFrame = sql(
+    """
+    select distinct contract_id, Customer_Name, convert(datetime, post_date) as post_date
+    from Report_Aspire_Contract_Modification as cm
+    where reason like 'Extended Covid Mod'
+	"""
+    )
+    out.post_date = map(out.post_date) do x
+        Date(x)
+    end
+    return out
+end # function
+
+Dates.Date(d::Missing) = missing
+
+# Pulls contract termination and non-accrual dates from TheSource, if they exist
+function termination_non_accrual_dates()
+    out::DataFrame = sql(
+    """
+    select lms.Contract_Id, convert(datetime, lms.Termination_Date) as termination_date, case
+	when na.non_accrual_date is not null then 1
+	else 0
+    end as is_non_accrual, na.non_accrual_date
+    from Opportunity_Contract_LMS as lms
+    left join (
+    	select Contract_Id, convert(datetime, min(post_date)) 'non_accrual_date'
+    	from Report_Aspire_Contract_Modification
+    	where Reason like 'Non-Accrual' or
+    	Contract_Id in ('40517-BW', '42192-1W') or
+    	(
+    		Reason like 'N/A' and
+    		Type like 'Contract Modification'
+    	)
+    	group by Contract_Id
+    ) as na on na.Contract_Id = lms.Contract_Id
+    where lms.Contract_Id like '%-%' and
+    lms.contract_id not like '%-%S' and
+    lms.Contract_Id not like '%OFEE' and
+    lms.Contract_Id not like '%TEST' and
+    lms.Contract_Id not like '%CP' and
+    lms.Contract_Id not like '%AM' and
+    lms.Contract_Id not like '%T%' and
+    lms.Contract_Id not like '%-10' and
+    lms.Contract_Id not like '%-20' and
+    year(lms.created_on_date) >= 2017
+    """
+    )
+    out.termination_date = map(out.termination_date) do x
+        Date(x)
+    end
+    out.non_accrual_date = map(out.non_accrual_date) do x
+        Date(x)
+    end
+    return out
+end # function
+
+# Pulls the deal type for each contract
+function dealtype()
+    out::DataFrame = sql(
+    """
+    select lms.contract_id, opp.deal_type
+    from opportunity_contract_lms as lms
+    inner join opportunity_contract as oc on oc.aspire_id = lms.contract_oid
+    inner join opportunity as opp on opp.id = oc.opportunity_id
+    where lms.Contract_Id like '%-%' and
+    lms.contract_id not like '%-%S' and
+    lms.Contract_Id not like '%OFEE' and
+    lms.Contract_Id not like '%TEST' and
+    lms.Contract_Id not like '%CP' and
+    lms.Contract_Id not like '%AM' and
+    lms.Contract_Id not like '%T%' and
+    lms.Contract_Id not like '%-10' and
+    lms.Contract_Id not like '%-20' and
+    year(lms.created_on_date) >= 2017
+    """
+    )
+end # function
+
+
+
+#=
+    This is the second big logical function. Steps are:
+    1. Join the invoicenumber() function with termination and non_accrual_date
+    2. Left Join to the extended mods
+    3. Left Join to the Deal Type
+    4. Find the contracts that are terminated pre subsequent effective date by saying:
+        If the termination date is null then 0
+        If the termination date is less than the subsequent effective date and this is
+        the first invoice, then 1
+        Else 0
+        Where 1 = a deal being terminated before subsequent effective date,
+        and 1 is not terminated before subsequent effective date.
+
+        The reason that it has to be on the first invoice is so that it gets counted correctly
+        in the pivot table later.
+    5. Check for remod status. A remod has to have, on its first invoice, a post date
+        from the extendedmods() function.
+    6. Check for rewrite and renewal status. A Renewal would have, on its first invoice,
+        additional information of "Remodification" and a deal type containing the word renewal.
+        A Rewrite would have, on its first invoice, additional information of
+        "Re-Modification" and a deal type of Rewrite.
+    7. If steps 4 - 6 all return 0, and a contract is on its first invoice post
+        subsequent effective date, then it is a step up.
+    8. Count the number of contracts for each subsequent effective date. That way the pivot can use
+        the average.
+=#
+function assemble()
+    tmp::DataFrame = invoicenumber()
+    out::DataFrame = @pipe tmp |>
+    leftjoin(
+        _,
+        termination_non_accrual_dates(),
+        on = :contract_id
+    ) |>
+    leftjoin(
+        _,
+        extendedmods(),
+        on = :contract_id
+    ) |>
+    leftjoin(
+        _,
+        innerjoin(
+            import_sfdata(),
+            bridge_sftocak(),
+            on = :id => :salesforce_id
+        ),
+        on = :contract_id
+    ) |>
+    leftjoin(
+        _,
+        dealtype(),
+        on = :contract_id
+    ) |>
+    transform(
+        _,
+        [:subsequent_effective_date, :termination_date, :is_1st_invoice] => ByRow(
+            (s, t, f) -> if ismissing(t)
+                0
+            elseif (t < s) && (f == 1)
+                1
+            else
+                0
+            end # if
+        ) => :terminated_pre_pmt_change,
+        [:post_date, :is_1st_invoice] => ByRow(
+            (pd, f) -> (ismissing(pd) || (f ≠ 1)) ? 0 : 1
+        ) => :is_remod,
+        [:additional_information_c, :deal_type, :is_1st_invoice] => ByRow(
+            (ai, dt, f) -> if (coalesce(ai, "") == "Re-Modification") && (dt == "Rewrite") && (f == 1)
+                1
+            else
+                0
+            end
+        ) => :is_rewrite,
+        [:additional_information_c, :deal_type, :is_1st_invoice] => ByRow(
+            (ai, dt, f) -> if (coalesce(ai, "") == "Re-Modification") && (occursin("Renewal", dt)) && (f == 1)
+                1
+            else
+                0
+            end
+        ) => :is_renewal
+    ) |>
+    transform(
+        _,
+        [:terminated_pre_pmt_change, :is_remod, :is_rewrite, :is_renewal, :is_1st_invoice] => ByRow(
+            (t, mod, write, renew, f) -> if (t + mod + write + renew == 0) && (f == 1)
+                1
+            else
+                0
+            end
+        ) => :is_stepup,
+    )
+
+    num_sed::DataFrame = @pipe out |>
+    select(
+        _,
+        [
+            :contract_id,
+            :subsequent_effective_date
+        ]
+    ) |>
+    unique(_) |>
+    groupby(
+        _,
+        [:subsequent_effective_date]
+    ) |>
+    combine(
+        _,
+        nrow
+    )
+
+    out = innerjoin(
+        out,
+        num_sed,
+        on = [:subsequent_effective_date => :subsequent_effective_date]
+    )
+
+    num_caks::DataFrame = @pipe out |>
+    select(
+        _,
+        [
+            :contract_id,
+            :subsequent_effective_date
+        ]
+    ) |>
+    unique(_) |>
+    groupby(
+        _,
+        :subsequent_effective_date
+    ) |>
+    combine(
+        _,
+        nrow => :num_caks
+    )
+
+
+    out = innerjoin(
+        out,
+        num_caks,
+        on = :subsequent_effective_date
+    )
+
+    transform!(
+        out,
+        [:nrow, :num_caks] => ByRow(
+            (n, caks) -> caks / n
+        ) => :nrow_part
+    )
+end # function
+
+function batchfile()
+    cmd::Cmd = `"C:/Users/Derek.Vetsch/Documents/Projects/Reporting/ModTracking/bat/open.bat"`
+    run(cmd)
+    return nothing
+end # function
+
+function report()
+    out::DataFrame = assemble()
+    CSV.write("outputs/master.csv", out)
+    batchfile()
+    return out
+end # function
+
+end # module
